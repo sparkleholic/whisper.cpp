@@ -1,0 +1,31 @@
+# Example configuration for whisper-client-microphone
+# Copy this file and modify as needed, then use:
+# ./build/bin/whisper-client-microphone $(cat config.txt)
+
+# Server configuration
+-s http://127.0.0.1:8080
+
+# Audio settings
+-d 3000        # 3-second chunks
+-r 16000       # 16kHz sample rate
+-t 0.6         # Voice activity threshold
+
+# Other options
+-v             # Verbose output
+
+# Uncomment to use specific audio device:
+# -c 1
+
+# Example configurations for different use cases:
+
+# Fast response (shorter chunks):
+# -d 1500 -t 0.5
+
+# High accuracy (longer chunks):
+# -d 5000 -t 0.7
+
+# Sensitive detection (picks up quiet speech):
+# -t 0.3
+
+# Remote server:
+# -s http://192.168.1.100:8080
