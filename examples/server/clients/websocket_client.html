@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Whisper.cpp WebSocket Client</title>
+    <meta charset="utf-8">
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .container {
+            margin: 20px 0;
+        }
+        .status {
+            padding: 10px;
+            border-radius: 5px;
+            margin: 10px 0;
+        }
+        .connected {
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        .disconnected {
+            background-color: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        .transcript {
+            background-color: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 5px;
+            padding: 15px;
+            min-height: 200px;
+            white-space: pre-wrap;
+            font-family: monospace;
+        }
+        button {
+            background-color: #007bff;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            margin: 5px;
+        }
+        button:disabled {
+            background-color: #6c757d;
+            cursor: not-allowed;
+        }
+        button:hover:not(:disabled) {
+            background-color: #0056b3;
+        }
+        input, select {
+            padding: 5px;
+            margin: 5px;
+            border: 1px solid #ced4da;
+            border-radius: 3px;
+        }
+        .config {
+            background-color: #e9ecef;
+            padding: 15px;
+            border-radius: 5px;
+            margin: 10px 0;
+        }
+    </style>
+</head>
+<body>
+    <h1>Whisper.cpp WebSocket Streaming Client</h1>
+    
+    <div class="container">
+        <h2>Connection</h2>
+        <div>
+            <label>WebSocket URL:</label>
+            <input type="text" id="wsUrl" value="ws://127.0.0.1:8081" style="width: 300px;">
+            <button id="connectBtn" onclick="connect()">Connect</button>
+            <button id="disconnectBtn" onclick="disconnect()" disabled>Disconnect</button>
+        </div>
+        <div id="status" class="status disconnected">Disconnected</div>
+    </div>
+
+    <div class="container">
+        <h2>Configuration</h2>
+        <div class="config">
+            <label>Language:</label>
+            <select id="language">
+                <option value="en">English</option>
+                <option value="es">Spanish</option>
+                <option value="fr">French</option>
+                <option value="de">German</option>
+                <option value="auto">Auto-detect</option>
+            </select>
+            
+            <label>Temperature:</label>
+            <input type="number" id="temperature" value="0.0" step="0.1" min="0" max="1">
+            
+            <label>VAD:</label>
+            <input type="checkbox" id="vad">
+            
+            <button onclick="createSession()">Create Session</button>
+        </div>
+        <div id="sessionInfo"></div>
+    </div>
+
+    <div class="container">
+        <h2>Audio Input</h2>
+        <input type="file" id="audioFile" accept="audio/*">
+        <button onclick="processAudio()" disabled id="processBtn">Process Audio</button>
+        
+        <div style="margin-top: 10px;">
+            <h3>Or use microphone (requires HTTPS):</h3>
+            <button onclick="startRecording()" disabled id="recordBtn">Start Recording</button>
+            <button onclick="stopRecording()" disabled id="stopBtn">Stop Recording</button>
+        </div>
+    </div>
+
+    <div class="container">
+        <h2>Transcript</h2>
+        <div id="transcript" class="transcript">Transcript will appear here...</div>
+        <button onclick="clearTranscript()">Clear</button>
+    </div>
+
+    <div class="container">
+        <h2>Messages</h2>
+        <div id="messages" class="transcript">WebSocket messages will appear here...</div>
+        <button onclick="clearMessages()">Clear</button>
+    </div>
+
+    <script>
+        let ws = null;
+        let sessionId = null;
+        let mediaRecorder = null;
+        let audioChunks = [];
+
+        function connect() {
+            const url = document.getElementById('wsUrl').value;
+            ws = new WebSocket(url);
+            
+            ws.onopen = function() {
+                document.getElementById('status').textContent = 'Connected';
+                document.getElementById('status').className = 'status connected';
+                document.getElementById('connectBtn').disabled = true;
+                document.getElementById('disconnectBtn').disabled = false;
+                addMessage('Connected to WebSocket server');
+            };
+            
+            ws.onclose = function() {
+                document.getElementById('status').textContent = 'Disconnected';
+                document.getElementById('status').className = 'status disconnected';
+                document.getElementById('connectBtn').disabled = false;
+                document.getElementById('disconnectBtn').disabled = true;
+                document.getElementById('processBtn').disabled = true;
+                sessionId = null;
+                addMessage('Disconnected from WebSocket server');
+            };
+            
+            ws.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+                addMessage('Received: ' + JSON.stringify(data, null, 2));
+                
+                if (data.type === 'session.created') {
+                    sessionId = data.session_id;
+                    document.getElementById('sessionInfo').innerHTML = `<strong>Session ID:</strong> ${sessionId}`;
+                    document.getElementById('processBtn').disabled = false;
+                    document.getElementById('recordBtn').disabled = false;
+                } else if (data.type === 'transcript') {
+                    if (data.segments && data.segments.length > 0) {
+                        const transcript = data.segments.map(s => `[${s.start.toFixed(2)}s - ${s.end.toFixed(2)}s] ${s.text}`).join('\n');
+                        addTranscript(transcript);
+                    }
+                }
+            };
+            
+            ws.onerror = function(error) {
+                addMessage('WebSocket error: ' + error);
+            };
+        }
+        
+        function disconnect() {
+            if (ws) {
+                ws.close();
+                ws = null;
+            }
+        }
+        
+        function createSession() {
+            if (!ws) {
+                alert('Please connect to WebSocket first');
+                return;
+            }
+            
+            const config = {
+                language: document.getElementById('language').value,
+                temperature: parseFloat(document.getElementById('temperature').value),
+                vad: document.getElementById('vad').checked
+            };
+            
+            const message = {
+                type: 'session.create',
+                config: config
+            };
+            
+            ws.send(JSON.stringify(message));
+            addMessage('Sent: ' + JSON.stringify(message, null, 2));
+        }
+        
+        function processAudio() {
+            const fileInput = document.getElementById('audioFile');
+            const file = fileInput.files[0];
+            
+            if (!file) {
+                alert('Please select an audio file');
+                return;
+            }
+            
+            if (!sessionId) {
+                alert('Please create a session first');
+                return;
+            }
+            
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                const arrayBuffer = e.target.result;
+                
+                // Convert to base64 for transmission
+                // Note: In a real implementation, you'd convert the audio to the expected format
+                const base64 = arrayBufferToBase64(arrayBuffer);
+                
+                // Send audio data
+                const audioMessage = {
+                    type: 'audio.append',
+                    session_id: sessionId,
+                    audio: base64
+                };
+                
+                ws.send(JSON.stringify(audioMessage));
+                addMessage('Sent audio data (' + base64.length + ' bytes)');
+                
+                // Commit for transcription
+                const commitMessage = {
+                    type: 'audio.commit',
+                    session_id: sessionId
+                };
+                
+                ws.send(JSON.stringify(commitMessage));
+                addMessage('Sent: ' + JSON.stringify(commitMessage, null, 2));
+            };
+            
+            reader.readAsArrayBuffer(file);
+        }
+        
+        function startRecording() {
+            navigator.mediaDevices.getUserMedia({ audio: true })
+                .then(stream => {
+                    mediaRecorder = new MediaRecorder(stream);
+                    audioChunks = [];
+                    
+                    mediaRecorder.ondataavailable = event => {
+                        audioChunks.push(event.data);
+                    };
+                    
+                    mediaRecorder.onstop = () => {
+                        const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
+                        const reader = new FileReader();
+                        
+                        reader.onload = function(e) {
+                            const arrayBuffer = e.target.result;
+                            const base64 = arrayBufferToBase64(arrayBuffer);
+                            
+                            // Send audio data
+                            const audioMessage = {
+                                type: 'audio.append',
+                                session_id: sessionId,
+                                audio: base64
+                            };
+                            
+                            ws.send(JSON.stringify(audioMessage));
+                            addMessage('Sent recorded audio data (' + base64.length + ' bytes)');
+                            
+                            // Commit for transcription
+                            const commitMessage = {
+                                type: 'audio.commit',
+                                session_id: sessionId
+                            };
+                            
+                            ws.send(JSON.stringify(commitMessage));
+                            addMessage('Sent: ' + JSON.stringify(commitMessage, null, 2));
+                        };
+                        
+                        reader.readAsArrayBuffer(audioBlob);
+                    };
+                    
+                    mediaRecorder.start();
+                    document.getElementById('recordBtn').disabled = true;
+                    document.getElementById('stopBtn').disabled = false;
+                    addMessage('Recording started...');
+                })
+                .catch(err => {
+                    addMessage('Error accessing microphone: ' + err);
+                });
+        }
+        
+        function stopRecording() {
+            if (mediaRecorder && mediaRecorder.state === 'recording') {
+                mediaRecorder.stop();
+                document.getElementById('recordBtn').disabled = false;
+                document.getElementById('stopBtn').disabled = true;
+                addMessage('Recording stopped');
+            }
+        }
+        
+        function arrayBufferToBase64(buffer) {
+            let binary = '';
+            const bytes = new Uint8Array(buffer);
+            const len = bytes.byteLength;
+            for (let i = 0; i < len; i++) {
+                binary += String.fromCharCode(bytes[i]);
+            }
+            return window.btoa(binary);
+        }
+        
+        function addMessage(message) {
+            const messagesDiv = document.getElementById('messages');
+            messagesDiv.textContent += new Date().toLocaleTimeString() + ': ' + message + '\n';
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+        
+        function addTranscript(text) {
+            const transcriptDiv = document.getElementById('transcript');
+            transcriptDiv.textContent += text + '\n';
+            transcriptDiv.scrollTop = transcriptDiv.scrollHeight;
+        }
+        
+        function clearMessages() {
+            document.getElementById('messages').textContent = '';
+        }
+        
+        function clearTranscript() {
+            document.getElementById('transcript').textContent = 'Transcript will appear here...';
+        }
+    </script>
+</body>
+</html>

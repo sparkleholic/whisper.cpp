@@ -4,6 +4,7 @@
 #include "whisper.h"
 #include "httplib.h"
 #include "json.hpp"
+#include "websocket.h"
 
 #include <cfloat>
 #include <chrono>
@@ -18,6 +19,7 @@
 #include <csignal>
 #include <atomic>
 #include <functional>
+#include <unordered_map>
 #include <cstdlib>
 #if defined (_WIN32)
 #include <windows.h>
@@ -64,6 +66,10 @@ struct server_params
     int32_t port          = 8080;
     int32_t read_timeout  = 600;
     int32_t write_timeout = 600;
+    
+    // WebSocket parameters
+    int32_t ws_port       = 8081;
+    bool enable_websocket = true;
 
     bool ffmpeg_converter = false;
 };
@@ -174,6 +180,8 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
     fprintf(stderr, "  --request-path PATH,           [%-7s] Request path for all requests\n", sparams.request_path.c_str());
     fprintf(stderr, "  --inference-path PATH,         [%-7s] Inference path for all requests\n", sparams.inference_path.c_str());
     fprintf(stderr, "  --convert,                     [%-7s] Convert audio to WAV, requires ffmpeg on the server\n", sparams.ffmpeg_converter ? "true" : "false");
+    fprintf(stderr, "  --ws-port PORT,                [%-7d] WebSocket port number\n", sparams.ws_port);
+    fprintf(stderr, "  --disable-websocket,           [%-7s] Disable WebSocket streaming API\n", sparams.enable_websocket ? "false" : "true");
     fprintf(stderr, "  -sns,      --suppress-nst      [%-7s] suppress non-speech tokens\n", params.suppress_nst ? "true" : "false");
     fprintf(stderr, "  -nth N,    --no-speech-thold N [%-7.2f] no speech threshold\n",   params.no_speech_thold);
     fprintf(stderr, "  -nc,       --no-context        [%-7s] do not use previous audio context\n", params.no_context ? "true" : "false");
@@ -248,6 +256,8 @@ bool whisper_params_parse(int argc, char ** argv, whisper_params & params, serve
         else if (                  arg == "--request-path")    { sparams.request_path = argv[++i]; }
         else if (                  arg == "--inference-path")  { sparams.inference_path = argv[++i]; }
         else if (                  arg == "--convert")         { sparams.ffmpeg_converter     = true; }
+        else if (                  arg == "--ws-port")        { sparams.ws_port              = std::stoi(argv[++i]); }
+        else if (                  arg == "--disable-websocket") { sparams.enable_websocket  = false; }
 
         // Voice Activity Detection (VAD)
         else if (                  arg == "--vad")                         { params.vad                         = true; }
@@ -609,6 +619,57 @@ void get_req_parameters(const Request & req, whisper_params & params)
 }
 
 }  // namespace
+
+// WebSocket session management
+struct ws_session {
+    std::string session_id;
+    std::vector<float> audio_buffer;
+    whisper_params params;
+    std::atomic<bool> active{false};
+};
+
+std::unordered_map<std::shared_ptr<websocket::Connection>, std::unique_ptr<ws_session>> ws_sessions;
+std::mutex ws_sessions_mutex;
+
+// Generate unique session ID
+std::string generate_session_id() {
+    static int counter = 0;
+    auto now = std::chrono::system_clock::now();
+    auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+    return "session_" + std::to_string(timestamp) + "_" + std::to_string(++counter);
+}
+
+// WebSocket streaming callback for Whisper
+void whisper_stream_callback(struct whisper_context * ctx, struct whisper_state * /*state*/, int n_new, void * user_data) {
+    auto conn = static_cast<std::shared_ptr<websocket::Connection>*>(user_data);
+    
+    std::lock_guard<std::mutex> lock(ws_sessions_mutex);
+    auto it = ws_sessions.find(*conn);
+    if (it == ws_sessions.end()) return;
+    
+    auto& session = it->second;
+    if (!session->active) return;
+    
+    const int n_segments = whisper_full_n_segments(ctx);
+    
+    for (int i = std::max(0, n_segments - n_new); i < n_segments; ++i) {
+        const char * text = whisper_full_get_segment_text(ctx, i);
+        const int64_t t0 = whisper_full_get_segment_t0(ctx, i);
+        const int64_t t1 = whisper_full_get_segment_t1(ctx, i);
+        
+        json response;
+        response["type"] = "transcription.segment";
+        response["text"] = text;
+        response["start_time"] = t0 * 10; // Convert to milliseconds
+        response["end_time"] = t1 * 10;
+        response["is_final"] = (i == n_segments - 1);
+        
+        std::string message = response.dump();
+        if ((*conn)->is_connected()) {
+            (*conn)->send_text(message);
+        }
+    }
+}
 
 int main(int argc, char ** argv) {
     ggml_backend_load_all();
@@ -1203,10 +1264,123 @@ int main(int argc, char ** argv) {
     // to make it ctrl+clickable:
     printf("\nwhisper server listening at http://%s:%d\n\n", sparams.hostname.c_str(), sparams.port);
 
+    // WebSocket server setup
+    std::unique_ptr<websocket::Server> ws_server;
+    std::thread ws_thread;
+    
+    if (sparams.enable_websocket) {
+        ws_server = std::make_unique<websocket::Server>();
+        
+        // WebSocket connection handler
+        ws_server->set_connect_handler([&](std::shared_ptr<websocket::Connection> conn) {
+            std::lock_guard<std::mutex> lock(ws_sessions_mutex);
+            auto session = std::make_unique<ws_session>();
+            session->session_id = generate_session_id();
+            session->params = params; // Copy default params
+            ws_sessions[conn] = std::move(session);
+            
+            json welcome;
+            welcome["type"] = "session.start";
+            welcome["session_id"] = ws_sessions[conn]->session_id;
+            conn->send_text(welcome.dump());
+            
+            printf("WebSocket client connected: %s\n", ws_sessions[conn]->session_id.c_str());
+        });
+        
+        // WebSocket message handler
+        ws_server->set_message_handler([&](std::shared_ptr<websocket::Connection> conn, const std::string& message) {
+            try {
+                json request = json::parse(message);
+                std::string type = request["type"];
+                
+                std::lock_guard<std::mutex> lock(ws_sessions_mutex);
+                auto it = ws_sessions.find(conn);
+                if (it == ws_sessions.end()) return;
+                
+                auto& session = it->second;
+                
+                if (type == "audio.start") {
+                    session->active = true;
+                    session->audio_buffer.clear();
+                    
+                    json response;
+                    response["type"] = "audio.started";
+                    conn->send_text(response.dump());
+                }
+                else if (type == "audio.data") {
+                    if (!session->active) return;
+                    
+                    // Decode base64 audio data
+                    std::string audio_data = request["data"];
+                    // TODO: Add proper base64 decoding and audio processing
+                    
+                    json response;
+                    response["type"] = "audio.received";
+                    conn->send_text(response.dump());
+                }
+                else if (type == "audio.end") {
+                    if (!session->active) return;
+                    session->active = false;
+                    
+                    // Process accumulated audio
+                    if (!session->audio_buffer.empty()) {
+                        std::lock_guard<std::mutex> whisper_lock(whisper_mutex);
+                        whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+                        wparams.print_realtime = false;
+                        wparams.print_progress = false;
+                        wparams.print_timestamps = false;
+                        wparams.print_special = false;
+                        wparams.new_segment_callback = whisper_stream_callback;
+                        wparams.new_segment_callback_user_data = &conn;
+                        
+                        if (whisper_full(ctx, wparams, session->audio_buffer.data(), session->audio_buffer.size()) != 0) {
+                            json error;
+                            error["type"] = "error";
+                            error["message"] = "Failed to process audio";
+                            conn->send_text(error.dump());
+                        }
+                    }
+                    
+                    json response;
+                    response["type"] = "audio.ended";
+                    conn->send_text(response.dump());
+                }
+            } catch (const std::exception& e) {
+                json error;
+                error["type"] = "error";
+                error["message"] = e.what();
+                conn->send_text(error.dump());
+            }
+        });
+        
+        // WebSocket disconnection handler
+        ws_server->set_disconnect_handler([&](std::shared_ptr<websocket::Connection> conn) {
+            std::lock_guard<std::mutex> lock(ws_sessions_mutex);
+            auto it = ws_sessions.find(conn);
+            if (it != ws_sessions.end()) {
+                printf("WebSocket client disconnected: %s\n", it->second->session_id.c_str());
+                ws_sessions.erase(it);
+            }
+        });
+        
+        // Start WebSocket server in separate thread
+        ws_thread = std::thread([&]() {
+            if (!ws_server->listen(sparams.ws_port, sparams.hostname)) {
+                fprintf(stderr, "Failed to start WebSocket server on %s:%d\n", 
+                        sparams.hostname.c_str(), sparams.ws_port);
+            }
+        });
+        
+        printf("WebSocket server listening at ws://%s:%d\n", sparams.hostname.c_str(), sparams.ws_port);
+    }
+
     shutdown_handler = [&](int signal) {
         printf("\nCaught signal %d, shutting down gracefully...\n", signal);
         if (svr) {
             svr->stop();
+        }
+        if (ws_server) {
+            ws_server->stop();
         }
     };
 
@@ -1239,6 +1413,11 @@ int main(int argc, char ** argv) {
     svr->wait_until_ready();
 
     t.join();
+
+    // Join WebSocket thread if it was started
+    if (ws_thread.joinable()) {
+        ws_thread.join();
+    }
 
 
     clean_up();
