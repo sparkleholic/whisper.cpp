@@ -58,9 +58,11 @@ struct client_params {
     int32_t chunk_duration_ms = 3000;  // 3 seconds
     int32_t capture_id = -1;
     int32_t sample_rate = 16000;
-    float vad_threshold = 0.6f;
+    float vad_threshold = 0.01f;  // Much lower default threshold
     bool verbose = false;
     bool help = false;
+    bool save_audio = false;  // Save audio chunks to files
+    std::string audio_output_dir = "./audio_chunks";  // Directory to save audio files
 };
 
 void print_usage(int argc, char ** argv, const client_params & params) {
@@ -72,9 +74,11 @@ void print_usage(int argc, char ** argv, const client_params & params) {
     fprintf(stdout, "  -s URL,    --server URL              [%s] STT server URL\n", params.server_url.c_str());
     fprintf(stdout, "  -d N,      --duration N              [%d] audio chunk duration in milliseconds\n", params.chunk_duration_ms);
     fprintf(stdout, "  -c N,      --capture-id N            [%d] capture device id (-1 for default)\n", params.capture_id);
-    fprintf(stdout, "  -t N,      --threshold N             [%.1f] voice activity detection threshold\n", params.vad_threshold);
+    fprintf(stdout, "  -t N,      --threshold N             [%.3f] voice activity detection threshold\n", params.vad_threshold);
     fprintf(stdout, "  -v,        --verbose                 [%s] verbose output\n", params.verbose ? "true" : "false");
     fprintf(stdout, "  -r N,      --sample-rate N           [%d] audio sample rate\n", params.sample_rate);
+    fprintf(stdout, "  --save-audio                         [%s] save audio chunks to files for debugging\n", params.save_audio ? "true" : "false");
+    fprintf(stdout, "  --audio-dir DIR                      [%s] directory to save audio files\n", params.audio_output_dir.c_str());
     fprintf(stdout, "\n");
 }
 
@@ -117,6 +121,14 @@ bool parse_params(int argc, char ** argv, client_params & params) {
             params.sample_rate = std::atoi(argv[i]);
         } else if (arg == "-v" || arg == "--verbose") {
             params.verbose = true;
+        } else if (arg == "--save-audio") {
+            params.save_audio = true;
+        } else if (arg == "--audio-dir") {
+            if (++i >= argc) {
+                fprintf(stderr, "Error: missing audio directory\n");
+                return false;
+            }
+            params.audio_output_dir = argv[i];
         } else {
             fprintf(stderr, "Error: unknown argument '%s'\n", arg.c_str());
             return false;
@@ -165,7 +177,7 @@ std::vector<uint8_t> create_wav_data(const std::vector<float>& audio_data, int s
 }
 
 // Simple voice activity detection
-bool detect_voice_activity(const std::vector<float>& audio_data, float threshold) {
+bool detect_voice_activity(const std::vector<float>& audio_data, float threshold, bool verbose = false) {
     if (audio_data.empty()) return false;
     
     // Calculate RMS energy
@@ -175,7 +187,19 @@ bool detect_voice_activity(const std::vector<float>& audio_data, float threshold
     }
     float rms = std::sqrt(sum_squares / audio_data.size());
     
-    return rms > threshold;
+    // Also calculate peak amplitude for better detection
+    float peak = 0.0f;
+    for (float sample : audio_data) {
+        peak = std::max(peak, std::abs(sample));
+    }
+    
+    if (verbose) {
+        std::cout << "Audio analysis - RMS: " << std::fixed << std::setprecision(4) << rms 
+                  << ", Peak: " << peak << ", Threshold: " << threshold << std::endl;
+    }
+    
+    // Use either RMS or peak detection - whichever is more sensitive
+    return (rms > threshold) || (peak > threshold * 2.0f);
 }
 
 // Get current timestamp string
@@ -189,6 +213,35 @@ std::string get_timestamp() {
     ss << std::put_time(std::localtime(&time_t), "%Y-%m-%d %H:%M:%S");
     ss << "." << std::setfill('0') << std::setw(3) << ms.count();
     return ss.str();
+}
+
+// Save audio chunk to WAV file
+bool save_audio_chunk(const std::vector<float>& audio_data, int sample_rate, 
+                     const std::string& filename) {
+    try {
+        auto wav_data = create_wav_data(audio_data, sample_rate);
+        
+        std::ofstream file(filename, std::ios::binary);
+        if (!file.is_open()) {
+            std::cerr << "Error: Could not open file for writing: " << filename << std::endl;
+            return false;
+        }
+        
+        file.write(reinterpret_cast<const char*>(wav_data.data()), wav_data.size());
+        file.close();
+        
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "Error saving audio file: " << e.what() << std::endl;
+        return false;
+    }
+}
+
+// Create directory if it doesn't exist
+bool create_directory(const std::string& path) {
+    // Simple directory creation using system call
+    std::string command = "mkdir -p \"" + path + "\"";
+    return system(command.c_str()) == 0;
 }
 
 // Send audio to server and get transcription
@@ -310,6 +363,13 @@ int main(int argc, char ** argv) {
     std::cout << "Chunk duration: " << params.chunk_duration_ms << "ms" << std::endl;
     std::cout << "Sample rate: " << params.sample_rate << "Hz" << std::endl;
     std::cout << "VAD threshold: " << params.vad_threshold << std::endl;
+    if (params.save_audio) {
+        std::cout << "Audio saving: ENABLED -> " << params.audio_output_dir << std::endl;
+        // Create output directory if it doesn't exist
+        if (!create_directory(params.audio_output_dir)) {
+            std::cerr << "Warning: Could not create audio output directory: " << params.audio_output_dir << std::endl;
+        }
+    }
     std::cout << std::endl;
 
     // Initialize audio capture
@@ -331,45 +391,107 @@ int main(int argc, char ** argv) {
     std::cout << std::endl;
 
     std::vector<float> audio_buffer;
+    std::vector<float> accumulation_buffer;  // Buffer to accumulate fresh audio
+    auto last_check_time = std::chrono::steady_clock::now();
+    const int check_interval_ms = 100;  // Check every 100ms for new audio
+    size_t last_audio_len = 0;  // Track how much audio we've processed
+    int chunk_counter = 0;  // Counter for saved audio files
     
     while (g_running) {
-        // Get audio data
-        audio.get(params.chunk_duration_ms, audio_buffer);
+        auto current_time = std::chrono::steady_clock::now();
+        auto time_since_last_check = std::chrono::duration_cast<std::chrono::milliseconds>(
+            current_time - last_check_time).count();
         
-        if (audio_buffer.empty()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            continue;
-        }
+        if (time_since_last_check >= check_interval_ms) {
+            // Get all available audio data
+            audio.get(params.chunk_duration_ms * 2, audio_buffer);  // Get more than needed to ensure we have fresh data
+            
+            if (!audio_buffer.empty() && audio_buffer.size() > last_audio_len) {
+                // Extract only the new audio samples since last check
+                std::vector<float> new_audio_samples;
+                if (last_audio_len < audio_buffer.size()) {
+                    new_audio_samples.assign(
+                        audio_buffer.begin() + last_audio_len, 
+                        audio_buffer.end()
+                    );
+                }
+                
+                if (!new_audio_samples.empty()) {
+                    // Append new audio to accumulation buffer
+                    accumulation_buffer.insert(accumulation_buffer.end(), 
+                                              new_audio_samples.begin(), new_audio_samples.end());
+                    
+                    if (params.verbose) {
+                        std::cout << "[" << get_timestamp() << "] Collected " << new_audio_samples.size() 
+                                  << " new samples, total accumulated: " << accumulation_buffer.size() << std::endl;
+                    }
+                }
+                
+                // Update the last processed length
+                last_audio_len = audio_buffer.size();
+                
+                // If we have enough audio data for a chunk, check if we should send
+                int samples_needed = (params.sample_rate * params.chunk_duration_ms) / 1000;
+                if (accumulation_buffer.size() >= samples_needed) {
+                    // Take exactly the number of samples needed for this chunk
+                    std::vector<float> chunk_to_send(accumulation_buffer.begin(), 
+                                                   accumulation_buffer.begin() + samples_needed);
+                    
+                    // Check voice activity for this specific chunk
+                    bool has_voice = detect_voice_activity(chunk_to_send, params.vad_threshold, params.verbose);
+                    
+                    // Save audio chunk if requested (regardless of voice activity)
+                    if (params.save_audio) {
+                        chunk_counter++;
+                        std::string filename = params.audio_output_dir + "/chunk_" + 
+                                             std::to_string(chunk_counter) + "_" + 
+                                             (has_voice ? "voice" : "silence") + ".wav";
+                        
+                        if (save_audio_chunk(chunk_to_send, params.sample_rate, filename)) {
+                            std::cout << "[" << get_timestamp() << "] Saved audio chunk: " << filename << std::endl;
+                        } else {
+                            std::cout << "[" << get_timestamp() << "] Failed to save audio chunk: " << filename << std::endl;
+                        }
+                    }
+                    
+                    if (has_voice) {
+                        std::cout << "[" << get_timestamp() << "] Sending audio chunk (" 
+                                  << (params.chunk_duration_ms / 1000.0f) << "s)..." << std::endl;
 
-        // Simple voice activity detection
-        if (!detect_voice_activity(audio_buffer, params.vad_threshold)) {
-            if (params.verbose) {
-                std::cout << "[" << get_timestamp() << "] No voice activity detected" << std::endl;
+                        // Convert to WAV format
+                        auto wav_data = create_wav_data(chunk_to_send, params.sample_rate);
+                        
+                        // Send to server
+                        std::string transcription = send_audio_to_server(wav_data, params);
+                        
+                        if (!transcription.empty() && transcription.find("Error:") != 0) {
+                            std::cout << "[" << get_timestamp() << "] Transcription: \"" 
+                                      << transcription << "\"" << std::endl;
+                        } else {
+                            std::cout << "[" << get_timestamp() << "] " << transcription << std::endl;
+                        }
+                        
+                        std::cout << std::endl;
+                    } else {
+                        if (params.verbose) {
+                            std::cout << "[" << get_timestamp() << "] No voice activity in chunk, skipping" << std::endl;
+                        }
+                    }
+                    
+                    // Remove the processed samples from accumulation buffer
+                    accumulation_buffer.erase(accumulation_buffer.begin(), 
+                                            accumulation_buffer.begin() + samples_needed);
+                    
+                    // Reset the audio length tracking since we've consumed data
+                    last_audio_len = 0;
+                    audio.clear();  // Clear the circular buffer to start fresh
+                }
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            continue;
-        }
-
-        std::cout << "[" << get_timestamp() << "] Sending audio chunk (" 
-                  << (params.chunk_duration_ms / 1000.0f) << "s)..." << std::endl;
-
-        // Convert to WAV format
-        auto wav_data = create_wav_data(audio_buffer, params.sample_rate);
-        
-        // Send to server
-        std::string transcription = send_audio_to_server(wav_data, params);
-        
-        if (!transcription.empty() && transcription.find("Error:") != 0) {
-            std::cout << "[" << get_timestamp() << "] Transcription: \"" 
-                      << transcription << "\"" << std::endl;
-        } else {
-            std::cout << "[" << get_timestamp() << "] " << transcription << std::endl;
+            
+            last_check_time = current_time;
         }
         
-        std::cout << std::endl;
-        
-        // Small delay to prevent overwhelming the server
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
     audio.pause();
