@@ -1290,6 +1290,12 @@ int main(int argc, char ** argv) {
         // WebSocket message handler
         ws_server->set_message_handler([&](std::shared_ptr<websocket::Connection> conn, const std::string& message) {
             try {
+                // Check if this looks like a valid JSON message
+                if (message.empty() || message[0] != '{') {
+                    printf("Warning: Received non-JSON message of length %zu\n", message.size());
+                    return;
+                }
+                
                 json request = json::parse(message);
                 std::string type = request["type"];
                 
@@ -1312,7 +1318,34 @@ int main(int argc, char ** argv) {
                     
                     // Decode base64 audio data
                     std::string audio_data = request["data"];
-                    // TODO: Add proper base64 decoding and audio processing
+                    
+                    try {
+                        // Decode base64 to binary data
+                        std::vector<uint8_t> wav_data = websocket::Base64::decode(audio_data);
+                        
+                        if (!wav_data.empty()) {
+                            // Convert binary WAV data to string for read_audio_data function
+                            std::string wav_content(wav_data.begin(), wav_data.end());
+                            
+                            // Parse WAV data and extract PCM samples
+                            std::vector<float> pcmf32;
+                            std::vector<std::vector<float>> pcmf32s;
+                            
+                            if (::read_audio_data(wav_content, pcmf32, pcmf32s, session->params.diarize)) {
+                                // Append PCM data to session audio buffer
+                                session->audio_buffer.insert(session->audio_buffer.end(), pcmf32.begin(), pcmf32.end());
+                                
+                                printf("Received and processed audio chunk: %zu samples (total: %zu)\n", 
+                                       pcmf32.size(), session->audio_buffer.size());
+                            } else {
+                                printf("Warning: Failed to parse WAV data from WebSocket client\n");
+                            }
+                        } else {
+                            printf("Warning: Empty audio data received from WebSocket client\n");
+                        }
+                    } catch (const std::exception& e) {
+                        printf("Error processing audio data: %s\n", e.what());
+                    }
                     
                     json response;
                     response["type"] = "audio.received";

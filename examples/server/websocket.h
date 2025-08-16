@@ -166,6 +166,66 @@ public:
         
         return encoded;
     }
+    
+    static std::vector<uint8_t> decode(const std::string& input) {
+        static const int decode_table[256] = {
+            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
+            52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
+            -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+            15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+            -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+            41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
+            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
+        };
+        
+        std::vector<uint8_t> decoded;
+        std::string clean_input;
+        
+        // Remove whitespace and padding
+        for (char c : input) {
+            if (c != ' ' && c != '\t' && c != '\n' && c != '\r') {
+                clean_input += c;
+            }
+        }
+        
+        // Remove padding
+        while (!clean_input.empty() && clean_input.back() == '=') {
+            clean_input.pop_back();
+        }
+        
+        for (size_t i = 0; i < clean_input.length(); i += 4) {
+            uint32_t a = (i < clean_input.length()) ? decode_table[static_cast<unsigned char>(clean_input[i])] : 0;
+            uint32_t b = (i + 1 < clean_input.length()) ? decode_table[static_cast<unsigned char>(clean_input[i + 1])] : 0;
+            uint32_t c = (i + 2 < clean_input.length()) ? decode_table[static_cast<unsigned char>(clean_input[i + 2])] : 0;
+            uint32_t d = (i + 3 < clean_input.length()) ? decode_table[static_cast<unsigned char>(clean_input[i + 3])] : 0;
+            
+            if (a == -1 || b == -1 || (i + 2 < clean_input.length() && c == -1) || (i + 3 < clean_input.length() && d == -1)) {
+                // Invalid base64 character
+                continue;
+            }
+            
+            uint32_t bitmap = (a << 18) | (b << 12) | (c << 6) | d;
+            
+            decoded.push_back((bitmap >> 16) & 0xFF);
+            if (i + 2 < clean_input.length()) {
+                decoded.push_back((bitmap >> 8) & 0xFF);
+            }
+            if (i + 3 < clean_input.length()) {
+                decoded.push_back(bitmap & 0xFF);
+            }
+        }
+        
+        return decoded;
+    }
 };
 
 // WebSocket frame opcodes
