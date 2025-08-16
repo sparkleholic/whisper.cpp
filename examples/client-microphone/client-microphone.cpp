@@ -23,6 +23,37 @@
 #include <cstring>
 #include <csignal>
 #include <atomic>
+#include <regex>
+
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "ws2_32.lib")
+typedef int socklen_t;
+#ifndef INVALID_SOCKET
+#define INVALID_SOCKET INVALID_SOCKET
+#endif
+#ifndef SOCKET_ERROR
+#define SOCKET_ERROR SOCKET_ERROR
+#endif
+#define closesocket closesocket
+typedef SOCKET socket_t;
+#else
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <netdb.h>
+#include <fcntl.h>
+#ifndef INVALID_SOCKET
+#define INVALID_SOCKET -1
+#endif
+#ifndef SOCKET_ERROR
+#define SOCKET_ERROR -1
+#endif
+#define closesocket close
+typedef int socket_t;
+#endif
 
 // Global flag for graceful shutdown
 std::atomic<bool> g_running{true};
@@ -51,10 +82,327 @@ struct WavHeader {
     uint32_t subchunk2_size; // Data size
 };
 
+// Simple Base64 encoder
+class Base64 {
+public:
+    static std::string encode(const std::vector<uint8_t>& data) {
+        static const char charset[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        std::string encoded;
+        
+        for (size_t i = 0; i < data.size(); i += 3) {
+            uint32_t a = data[i];
+            uint32_t b = (i + 1 < data.size()) ? data[i + 1] : 0;
+            uint32_t c = (i + 2 < data.size()) ? data[i + 2] : 0;
+            
+            uint32_t bitmap = (a << 16) | (b << 8) | c;
+            
+            encoded += charset[(bitmap >> 18) & 0x3F];
+            encoded += charset[(bitmap >> 12) & 0x3F];
+            encoded += (i + 1 < data.size()) ? charset[(bitmap >> 6) & 0x3F] : '=';
+            encoded += (i + 2 < data.size()) ? charset[bitmap & 0x3F] : '=';
+        }
+        
+        return encoded;
+    }
+};
+
+// Simple WebSocket client for real-time streaming
+class WebSocketClient {
+private:
+    socket_t socket_;
+    bool connected_;
+    std::string host_;
+    int port_;
+    
+public:
+    WebSocketClient() : socket_(INVALID_SOCKET), connected_(false) {
+#ifdef _WIN32
+        WSADATA wsaData;
+        WSAStartup(MAKEWORD(2, 2), &wsaData);
+#endif
+    }
+    
+    ~WebSocketClient() {
+        disconnect();
+#ifdef _WIN32
+        WSACleanup();
+#endif
+    }
+    
+    bool connect(const std::string& url) {
+        // Parse WebSocket URL (ws://host:port)
+        std::regex url_regex(R"(ws://([^:]+):(\d+))");
+        std::smatch matches;
+        
+        if (!std::regex_match(url, matches, url_regex)) {
+            std::cerr << "Invalid WebSocket URL format: " << url << std::endl;
+            return false;
+        }
+        
+        host_ = matches[1].str();
+        port_ = std::stoi(matches[2].str());
+        
+        // Create socket
+        socket_ = socket(AF_INET, SOCK_STREAM, 0);
+        if (socket_ == INVALID_SOCKET) {
+            std::cerr << "Failed to create socket" << std::endl;
+            return false;
+        }
+        
+        // Resolve host
+        struct hostent* he = gethostbyname(host_.c_str());
+        if (!he) {
+            std::cerr << "Failed to resolve host: " << host_ << std::endl;
+            closesocket(socket_);
+            return false;
+        }
+        
+        // Connect to server
+        struct sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port_);
+        memcpy(&addr.sin_addr, he->h_addr_list[0], he->h_length);
+        
+        if (::connect(socket_, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
+            std::cerr << "Failed to connect to " << host_ << ":" << port_;
+#ifndef _WIN32
+            std::cerr << " - Error: " << strerror(errno);
+#endif
+            std::cerr << std::endl;
+            closesocket(socket_);
+            return false;
+        }
+        
+        std::cout << "TCP connection established to " << host_ << ":" << port_ << std::endl;
+        
+        // Perform WebSocket handshake
+        std::cout << "Performing WebSocket handshake..." << std::endl;
+        if (!perform_handshake()) {
+            std::cerr << "WebSocket handshake failed" << std::endl;
+            closesocket(socket_);
+            return false;
+        }
+        
+        std::cout << "WebSocket handshake successful" << std::endl;
+        
+        // Set socket to non-blocking mode for receive operations
+#ifdef _WIN32
+        u_long mode = 1;
+        ioctlsocket(socket_, FIONBIO, &mode);
+#else
+        int flags = fcntl(socket_, F_GETFL, 0);
+        fcntl(socket_, F_SETFL, flags | O_NONBLOCK);
+#endif
+        
+        connected_ = true;
+        return true;
+    }
+    
+    void disconnect() {
+        if (connected_ && socket_ != INVALID_SOCKET) {
+            closesocket(socket_);
+            connected_ = false;
+            socket_ = INVALID_SOCKET;
+        }
+    }
+    
+    bool send_text(const std::string& message) {
+        if (!connected_) return false;
+        
+        std::vector<uint8_t> frame;
+        
+        // WebSocket frame format for text message
+        frame.push_back(0x81); // FIN=1, opcode=1 (text)
+        
+        size_t len = message.length();
+        if (len < 126) {
+            frame.push_back(0x80 | len); // MASK=1, payload length
+        } else if (len < 65536) {
+            frame.push_back(0x80 | 126); // MASK=1, extended payload length
+            frame.push_back((len >> 8) & 0xFF);
+            frame.push_back(len & 0xFF);
+        } else {
+            // Handle larger payloads
+            frame.push_back(0x80 | 127); // MASK=1, 64-bit extended payload length
+            for (int i = 7; i >= 0; --i) {
+                frame.push_back((len >> (i * 8)) & 0xFF);
+            }
+        }
+        
+        // Masking key (simple, not cryptographically secure)
+        uint8_t mask[4] = {0x12, 0x34, 0x56, 0x78};
+        frame.insert(frame.end(), mask, mask + 4);
+        
+        // Masked payload
+        for (size_t i = 0; i < len; ++i) {
+            frame.push_back(message[i] ^ mask[i % 4]);
+        }
+        
+        ssize_t sent = send(socket_, reinterpret_cast<const char*>(frame.data()), frame.size(), 0);
+        if (sent != static_cast<ssize_t>(frame.size())) {
+            std::cerr << "[Debug] WebSocket send failed. Expected " << frame.size() 
+                      << " bytes, sent " << sent << " bytes" << std::endl;
+            if (sent == -1) {
+#ifdef _WIN32
+                std::cerr << "[Debug] Send error: " << WSAGetLastError() << std::endl;
+#else
+                std::cerr << "[Debug] Send error: " << strerror(errno) << std::endl;
+#endif
+                connected_ = false;
+            }
+            return false;
+        }
+        return true;
+    }
+    
+    std::string receive_text() {
+        if (!connected_) return "";
+        
+        char buffer[4096];
+        ssize_t received = recv(socket_, buffer, sizeof(buffer) - 1, 0);
+        if (received <= 0) {
+            if (received == 0) {
+                std::cerr << "[Debug] Connection closed by server" << std::endl;
+                connected_ = false;
+            } else {
+#ifdef _WIN32
+                int error = WSAGetLastError();
+                if (error != WSAEWOULDBLOCK) {
+                    std::cerr << "[Debug] recv() error: " << error << std::endl;
+                    connected_ = false;
+                }
+#else
+                if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                    std::cerr << "[Debug] recv() error: " << strerror(errno) << std::endl;
+                    connected_ = false;
+                }
+#endif
+            }
+            return "";
+        }
+        
+        std::cerr << "[Debug] received " << received << " bytes" << std::endl;
+        
+        // Simple frame parsing (assumes single frame, text message)
+        if (received < 2) return "";
+        
+        uint8_t* data = reinterpret_cast<uint8_t*>(buffer);
+        bool fin = (data[0] & 0x80) != 0;
+        uint8_t opcode = data[0] & 0x0F;
+        
+        // Handle close frame
+        if (opcode == 8) {
+            std::cerr << "[Debug] Received WebSocket close frame" << std::endl;
+            connected_ = false;
+            return "";
+        }
+        
+        // Handle ping frame
+        if (opcode == 9) {
+            std::cerr << "[Debug] Received WebSocket ping frame" << std::endl;
+            // Should send pong, but for simplicity we'll just ignore
+            return "";
+        }
+        
+        // Handle pong frame
+        if (opcode == 10) {
+            std::cerr << "[Debug] Received WebSocket pong frame" << std::endl;
+            return "";
+        }
+        
+        if (opcode != 1) {
+            std::cerr << "[Debug] Received non-text frame with opcode: " << static_cast<int>(opcode) << std::endl;
+            return ""; // Not a text frame
+        }
+        
+        bool masked = (data[1] & 0x80) != 0;
+        uint64_t payload_len = data[1] & 0x7F;
+        
+        size_t header_len = 2;
+        if (payload_len == 126) {
+            if (received < 4) return "";
+            payload_len = (data[2] << 8) | data[3];
+            header_len = 4;
+        } else if (payload_len == 127) {
+            if (received < 10) return "";
+            payload_len = 0;
+            for (int i = 0; i < 8; ++i) {
+                payload_len = (payload_len << 8) | data[2 + i];
+            }
+            header_len = 10;
+        }
+        
+        if (masked) header_len += 4; // Mask key
+        
+        if (static_cast<size_t>(received) < header_len + payload_len) {
+            std::cerr << "[Debug] Incomplete frame received. Got " << received 
+                      << " bytes, need " << (header_len + payload_len) << std::endl;
+            return "";
+        }
+        
+        std::string message;
+        size_t payload_start = header_len;
+        
+        if (masked) {
+            uint8_t* mask = data + header_len - 4;
+            for (size_t i = 0; i < payload_len; ++i) {
+                message += static_cast<char>(data[payload_start + i] ^ mask[i % 4]);
+            }
+        } else {
+            message.assign(reinterpret_cast<char*>(data + payload_start), payload_len);
+        }
+        
+        return message;
+    }
+    
+    bool is_connected() const { return connected_; }
+    
+private:
+    bool perform_handshake() {
+        // Send WebSocket handshake request
+        std::string request = 
+            "GET / HTTP/1.1\r\n"
+            "Host: " + host_ + ":" + std::to_string(port_) + "\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            "Sec-WebSocket-Version: 13\r\n"
+            "\r\n";
+        
+        if (send(socket_, request.c_str(), request.length(), 0) != static_cast<int>(request.length())) {
+            std::cerr << "Failed to send handshake request" << std::endl;
+            return false;
+        }
+        
+        // Receive handshake response
+        char buffer[1024];
+        ssize_t received = recv(socket_, buffer, sizeof(buffer) - 1, 0);
+        if (received <= 0) {
+            std::cerr << "Failed to receive handshake response" << std::endl;
+            return false;
+        }
+        
+        buffer[received] = '\0';
+        std::string response(buffer);
+        
+        // Check for successful handshake
+        if (response.find("HTTP/1.1 101") == std::string::npos) {
+            std::cerr << "WebSocket handshake failed" << std::endl;
+            std::cerr << "Response: " << response << std::endl;
+            return false;
+        }
+        
+        return true;
+    }
+};
+
 // Command-line parameters
 struct client_params {
     std::string server_url = "http://127.0.0.1:8080";
     std::string inference_path = "/inference";
+    std::string ws_url = "ws://127.0.0.1:8081";  // WebSocket URL
+    bool use_websocket = false;  // Use WebSocket streaming instead of HTTP
     int32_t chunk_duration_ms = 3000;  // 3 seconds
     int32_t capture_id = -1;
     int32_t sample_rate = 16000;
@@ -72,6 +420,8 @@ void print_usage(int argc, char ** argv, const client_params & params) {
     fprintf(stdout, "options:\n");
     fprintf(stdout, "  -h,        --help                    show this help message and exit\n");
     fprintf(stdout, "  -s URL,    --server URL              [%s] STT server URL\n", params.server_url.c_str());
+    fprintf(stdout, "  -w URL,    --websocket URL           [%s] WebSocket server URL\n", params.ws_url.c_str());
+    fprintf(stdout, "  --ws,      --use-websocket           [%s] use WebSocket streaming (default: HTTP)\n", params.use_websocket ? "true" : "false");
     fprintf(stdout, "  -d N,      --duration N              [%d] audio chunk duration in milliseconds\n", params.chunk_duration_ms);
     fprintf(stdout, "  -c N,      --capture-id N            [%d] capture device id (-1 for default)\n", params.capture_id);
     fprintf(stdout, "  -t N,      --threshold N             [%.3f] voice activity detection threshold\n", params.vad_threshold);
@@ -95,6 +445,14 @@ bool parse_params(int argc, char ** argv, client_params & params) {
                 return false;
             }
             params.server_url = argv[i];
+        } else if (arg == "-w" || arg == "--websocket") {
+            if (++i >= argc) {
+                fprintf(stderr, "Error: missing WebSocket URL\n");
+                return false;
+            }
+            params.ws_url = argv[i];
+        } else if (arg == "--ws" || arg == "--use-websocket") {
+            params.use_websocket = true;
         } else if (arg == "-d" || arg == "--duration") {
             if (++i >= argc) {
                 fprintf(stderr, "Error: missing duration value\n");
@@ -341,6 +699,224 @@ std::string send_audio_to_server(const std::vector<uint8_t>& wav_data,
     }
 }
 
+// WebSocket streaming client for real-time transcription
+class WebSocketStreamer {
+private:
+    WebSocketClient client_;
+    std::string ws_url_;
+    bool verbose_;
+    std::atomic<bool> connected_{false};
+    std::atomic<bool> session_active_{false};
+    std::thread message_thread_;
+    
+public:
+    WebSocketStreamer(const std::string& ws_url, bool verbose) 
+        : ws_url_(ws_url), verbose_(verbose) {}
+    
+    ~WebSocketStreamer() {
+        disconnect();
+    }
+    
+    bool connect() {
+        if (verbose_) {
+            std::cout << "Connecting to WebSocket server: " << ws_url_ << std::endl;
+        }
+        
+        if (!client_.connect(ws_url_)) {
+            return false;
+        }
+        
+        connected_ = true;
+        
+        // Start message receiving thread
+        message_thread_ = std::thread([this]() {
+            while (connected_ && client_.is_connected()) {
+                std::string message = client_.receive_text();
+                if (!message.empty()) {
+                    if (verbose_) {
+                        std::cout << "[Debug] Received message: " << message << std::endl;
+                    }
+                    handle_message(message);
+                } else {
+                    // Check if the client is still connected
+                    if (!client_.is_connected()) {
+                        std::cerr << "[Debug] WebSocket client disconnected" << std::endl;
+                        connected_ = false;
+                        session_active_ = false;
+                        break;
+                    }
+                    
+                    if (verbose_) {
+                        // Reduce verbosity of empty message logs
+                        static int empty_count = 0;
+                        if (++empty_count % 100 == 0) {
+                            std::cout << "[Debug] No messages for " << empty_count << " attempts" << std::endl;
+                        }
+                    }
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            if (verbose_) {
+                std::cout << "[Debug] Message thread exiting - connected: " << connected_ 
+                          << ", client connected: " << client_.is_connected() << std::endl;
+            }
+        });
+        
+        // Wait for session start message from server
+        if (verbose_) {
+            std::cout << "[Debug] Waiting for session start message..." << std::endl;
+        }
+        auto start_time = std::chrono::steady_clock::now();
+        while (!session_active_ && 
+               std::chrono::steady_clock::now() - start_time < std::chrono::seconds(5)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        
+        if (verbose_) {
+            std::cout << "[Debug] Session active: " << session_active_ << std::endl;
+        }
+        
+        return session_active_;
+    }
+    
+    void disconnect() {
+        connected_ = false;
+        session_active_ = false;
+        
+        if (message_thread_.joinable()) {
+            message_thread_.join();
+        }
+        
+        client_.disconnect();
+    }
+    
+    bool send_audio_chunk(const std::vector<uint8_t>& wav_data) {
+        if (!connected_ || !session_active_ || !client_.is_connected()) {
+            if (!client_.is_connected()) {
+                std::cerr << "[Debug] WebSocket client is no longer connected" << std::endl;
+                connected_ = false;
+                session_active_ = false;
+            }
+            return false;
+        }
+        
+        if (verbose_) {
+            std::cout << "[Debug] Sending audio chunk of " << wav_data.size() << " bytes" << std::endl;
+        }
+        
+        // Start audio processing
+        std::string start_msg = R"({"type": "audio.start"})";
+        if (!client_.send_text(start_msg)) {
+            std::cerr << "[Debug] Failed to send audio.start message" << std::endl;
+            return false;
+        }
+        
+        // Give the server time to process the start message
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        
+        // Encode audio data as base64
+        std::string base64_audio = Base64::encode(wav_data);
+        
+        if (verbose_) {
+            std::cout << "[Debug] Encoded audio data to " << base64_audio.length() << " base64 characters" << std::endl;
+        }
+        
+        // Send audio data
+        std::string audio_msg = R"({"type": "audio.data", "data": ")" + base64_audio + R"("})";
+        if (!client_.send_text(audio_msg)) {
+            std::cerr << "[Debug] Failed to send audio.data message" << std::endl;
+            return false;
+        }
+        
+        // Give the server time to process the audio data
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        
+        // End audio processing
+        std::string end_msg = R"({"type": "audio.end"})";
+        if (!client_.send_text(end_msg)) {
+            std::cerr << "[Debug] Failed to send audio.end message" << std::endl;
+            return false;
+        }
+        
+        return true;
+    }
+    
+    bool is_connected() const {
+        return connected_ && session_active_ && client_.is_connected();
+    }
+    
+private:
+    void handle_message(const std::string& message) {
+        if (verbose_) {
+            std::cout << "[WebSocket] Received: " << message << std::endl;
+        }
+        
+        // Simple JSON parsing for message type
+        size_t type_pos = message.find("\"type\"");
+        if (type_pos == std::string::npos) return;
+        
+        size_t colon_pos = message.find(":", type_pos);
+        if (colon_pos == std::string::npos) return;
+        
+        size_t quote_start = message.find("\"", colon_pos);
+        if (quote_start == std::string::npos) return;
+        quote_start++;
+        
+        size_t quote_end = message.find("\"", quote_start);
+        if (quote_end == std::string::npos) return;
+        
+        std::string msg_type = message.substr(quote_start, quote_end - quote_start);
+        
+        if (msg_type == "session.start") {
+            session_active_ = true;
+            if (verbose_) {
+                std::cout << "[WebSocket] Session started" << std::endl;
+            }
+        } else if (msg_type == "audio.started") {
+            if (verbose_) {
+                std::cout << "[WebSocket] Audio processing started" << std::endl;
+            }
+        } else if (msg_type == "audio.received") {
+            if (verbose_) {
+                std::cout << "[WebSocket] Audio data received by server" << std::endl;
+            }
+        } else if (msg_type == "audio.ended") {
+            if (verbose_) {
+                std::cout << "[WebSocket] Audio processing ended" << std::endl;
+            }
+        } else if (msg_type == "transcription.segment") {
+            // Extract transcription text
+            size_t text_pos = message.find("\"text\"");
+            if (text_pos != std::string::npos) {
+                size_t text_colon = message.find(":", text_pos);
+                if (text_colon != std::string::npos) {
+                    size_t text_quote_start = message.find("\"", text_colon);
+                    if (text_quote_start != std::string::npos) {
+                        text_quote_start++;
+                        size_t text_quote_end = text_quote_start;
+                        
+                        // Find the end quote, handling escaped quotes
+                        while (text_quote_end < message.length()) {
+                            if (message[text_quote_end] == '\"' && 
+                                (text_quote_end == 0 || message[text_quote_end - 1] != '\\')) {
+                                break;
+                            }
+                            text_quote_end++;
+                        }
+                        
+                        if (text_quote_end < message.length()) {
+                            std::string transcription = message.substr(text_quote_start, text_quote_end - text_quote_start);
+                            if (!transcription.empty()) {
+                                std::cout << "[" << get_timestamp() << "] Real-time: \"" << transcription << "\"" << std::endl;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+};
+
 int main(int argc, char ** argv) {
     client_params params;
 
@@ -360,6 +936,9 @@ int main(int argc, char ** argv) {
 
     std::cout << "Whisper STT Client - Microphone Stream" << std::endl;
     std::cout << "Server: " << params.server_url << std::endl;
+    if (params.use_websocket) {
+        std::cout << "WebSocket: " << params.ws_url << " (streaming mode)" << std::endl;
+    }
     std::cout << "Chunk duration: " << params.chunk_duration_ms << "ms" << std::endl;
     std::cout << "Sample rate: " << params.sample_rate << "Hz" << std::endl;
     std::cout << "VAD threshold: " << params.vad_threshold << std::endl;
@@ -387,6 +966,18 @@ int main(int argc, char ** argv) {
     }
 
     std::cout << "Audio device opened successfully" << std::endl;
+    
+    // Initialize WebSocket streaming if enabled
+    std::unique_ptr<WebSocketStreamer> ws_streamer;
+    if (params.use_websocket) {
+        ws_streamer = std::make_unique<WebSocketStreamer>(params.ws_url, params.verbose);
+        if (!ws_streamer->connect()) {
+            std::cerr << "Error: failed to connect to WebSocket server" << std::endl;
+            return 1;
+        }
+        std::cout << "WebSocket connection established" << std::endl;
+    }
+    
     std::cout << "Listening... (Press Ctrl+C to stop)" << std::endl;
     std::cout << std::endl;
 
@@ -461,14 +1052,46 @@ int main(int argc, char ** argv) {
                         // Convert to WAV format
                         auto wav_data = create_wav_data(chunk_to_send, params.sample_rate);
                         
-                        // Send to server
-                        std::string transcription = send_audio_to_server(wav_data, params);
-                        
-                        if (!transcription.empty() && transcription.find("Error:") != 0) {
-                            std::cout << "[" << get_timestamp() << "] Transcription: \"" 
-                                      << transcription << "\"" << std::endl;
+                        if (params.use_websocket && ws_streamer) {
+                            // Check if WebSocket connection is still alive
+                            if (!ws_streamer->is_connected()) {
+                                std::cout << "[" << get_timestamp() << "] WebSocket disconnected, attempting to reconnect..." << std::endl;
+                                ws_streamer->disconnect();
+                                if (ws_streamer->connect()) {
+                                    std::cout << "[" << get_timestamp() << "] WebSocket reconnection successful" << std::endl;
+                                } else {
+                                    std::cout << "[" << get_timestamp() << "] WebSocket reconnection failed, falling back to HTTP" << std::endl;
+                                }
+                            }
+                            
+                            // Send via WebSocket for real-time streaming
+                            if (ws_streamer->is_connected()) {
+                                if (!ws_streamer->send_audio_chunk(wav_data)) {
+                                    std::cout << "[" << get_timestamp() << "] Error: Failed to send audio chunk via WebSocket" << std::endl;
+                                }
+                                // Note: Transcription will be received asynchronously in the WebSocket message handler
+                            } else {
+                                // Fallback to HTTP if WebSocket is not available
+                                std::cout << "[" << get_timestamp() << "] Falling back to HTTP for this chunk..." << std::endl;
+                                std::string transcription = send_audio_to_server(wav_data, params);
+                                
+                                if (!transcription.empty() && transcription.find("Error:") != 0) {
+                                    std::cout << "[" << get_timestamp() << "] Transcription: \"" 
+                                              << transcription << "\"" << std::endl;
+                                } else {
+                                    std::cout << "[" << get_timestamp() << "] " << transcription << std::endl;
+                                }
+                            }
                         } else {
-                            std::cout << "[" << get_timestamp() << "] " << transcription << std::endl;
+                            // Send via HTTP
+                            std::string transcription = send_audio_to_server(wav_data, params);
+                            
+                            if (!transcription.empty() && transcription.find("Error:") != 0) {
+                                std::cout << "[" << get_timestamp() << "] Transcription: \"" 
+                                          << transcription << "\"" << std::endl;
+                            } else {
+                                std::cout << "[" << get_timestamp() << "] " << transcription << std::endl;
+                            }
                         }
                         
                         std::cout << std::endl;
